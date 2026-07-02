@@ -39,7 +39,7 @@ const validasiPengajuanPeminjaman = async (idAnggota, idBuku) => {
 
   const isAkunAktif = await validasiStatusAkun(idAnggota);
   if (!isAkunAktif) {
-    return { isValid: false, message: 'Akun anggota tidak aktif' };
+    return { isValid: false, message: 'Akun anggota tidak aktif atau belum diverifikasi oleh pustakawan.' };
   }
 
   // Cek eksistensi buku
@@ -58,38 +58,38 @@ const validasiPengajuanPeminjaman = async (idAnggota, idBuku) => {
 
 /**
  * Memproses pencatatan transaksi peminjaman baru ke database secara transaksional.
- * @param {object} client Client database dari transaction pool
- * @param {number} idAnggota 
- * @param {number} idBuku 
- * @returns {Promise<object>} Data hasil penyimpanan
  */
-const prosesPencatatanPeminjaman = async (client, idAnggota, idBuku) => {
+const prosesPencatatanPeminjaman = async (client, idAnggota, idBuku, status = 'Berjalan') => {
   const tanggalPinjam = new Date();
   const batasKembali = new Date();
   batasKembali.setDate(tanggalPinjam.getDate() + 7);
 
   const insertPeminjamanQuery = `
     INSERT INTO transaksi_peminjaman (id_anggota, tanggal_pinjam, batas_kembali, status_transaksi)
-    VALUES ($1, $2, $3, 'Berjalan')
+    VALUES ($1, $2, $3, $4)
     RETURNING id_transaksi, tanggal_pinjam, batas_kembali, status_transaksi
   `;
   const peminjamanResult = await client.query(insertPeminjamanQuery, [
     idAnggota,
     tanggalPinjam,
-    batasKembali
+    batasKembali,
+    status
   ]);
 
   const idTransaksi = peminjamanResult.rows[0].id_transaksi;
+  const statusBuku = status === 'Pengajuan' ? 'Pengajuan' : 'Dipinjam';
 
   const insertDetailQuery = `
-    INSERT INTO detail_transaksi (id_transaksi, id_buku, status_buku)
-    VALUES ($1, $2, 'Dipinjam')
+    INSERT INTO detail_transaksi (id_transaksi, id_buku, status_buku, status_denda)
+    VALUES ($1, $2, $3, 'Lunas')
     RETURNING id_detail, status_buku
   `;
-  const detailResult = await client.query(insertDetailQuery, [idTransaksi, idBuku]);
+  const detailResult = await client.query(insertDetailQuery, [idTransaksi, idBuku, statusBuku]);
 
-  const updateStokQuery = 'UPDATE buku SET stok = stok - 1 WHERE id_buku = $1';
-  await client.query(updateStokQuery, [idBuku]);
+  if (status === 'Berjalan') {
+    const updateStokQuery = 'UPDATE buku SET stok = stok - 1 WHERE id_buku = $1';
+    await client.query(updateStokQuery, [idBuku]);
+  }
 
   return {
     id_transaksi: idTransaksi,
@@ -104,10 +104,6 @@ const prosesPencatatanPeminjaman = async (client, idAnggota, idBuku) => {
 
 /**
  * Memverifikasi kelayakan transaksi pengembalian buku.
- * @param {object} client Client database dari transaction pool
- * @param {number} idTransaksi 
- * @param {number} idBuku 
- * @returns {Promise<object>} Data detail transaksi
  */
 const prosesVerifikasiPengembalian = async (client, idTransaksi, idBuku) => {
   const checkDetailQuery = 'SELECT * FROM detail_transaksi WHERE id_transaksi = $1 AND id_buku = $2 FOR UPDATE';
@@ -127,9 +123,6 @@ const prosesVerifikasiPengembalian = async (client, idTransaksi, idBuku) => {
 
 /**
  * Menghitung denda keterlambatan secara otomatis.
- * @param {Date|string} tanggalBatas 
- * @param {Date|string} tanggalKembali 
- * @returns {number} Jumlah denda
  */
 const hitungDendaOtomatis = (tanggalBatas, tanggalKembali) => {
   const tKembali = new Date(tanggalKembali);
@@ -142,7 +135,7 @@ const hitungDendaOtomatis = (tanggalBatas, tanggalKembali) => {
   const lateDays = Math.ceil(timeDiff / (1000 * 3600 * 24));
 
   if (lateDays > 0) {
-    return lateDays * 2000;
+    return lateDays * 2000; // Denda Rp2.000 per hari
   }
   return 0;
 };
@@ -151,11 +144,13 @@ const hitungDendaOtomatis = (tanggalBatas, tanggalKembali) => {
 
 // 1. Memproses Transaksi Peminjaman (POST)
 const prosesPeminjaman = async (req, res) => {
-  const { id_anggota, id_buku } = req.body;
+  const { id_anggota, id_buku, status } = req.body; // status can be 'Pengajuan' or 'Berjalan'
 
   if (!id_anggota || !id_buku) {
     return res.status(400).json({ message: 'id_anggota dan id_buku wajib diisi' });
   }
+
+  const statusTransaksi = status || 'Berjalan'; // Default to counter checkouts
 
   try {
     // A. Validasi Ganda (Pengajuan Peminjaman)
@@ -172,12 +167,14 @@ const prosesPeminjaman = async (req, res) => {
       // Lock buku untuk menghindari race condition
       await client.query('SELECT stok FROM buku WHERE id_buku = $1 FOR UPDATE', [id_buku]);
 
-      // Catat peminjaman
-      const record = await prosesPencatatanPeminjaman(client, id_anggota, id_buku);
+      // Catat peminjaman (status_transaksi = 'Pengajuan' / 'Berjalan')
+      const record = await prosesPencatatanPeminjaman(client, id_anggota, id_buku, statusTransaksi);
 
       await client.query('COMMIT');
       return res.status(201).json({
-        message: 'Transaksi peminjaman berhasil diproses',
+        message: statusTransaksi === 'Pengajuan' 
+          ? 'Pengajuan peminjaman berhasil dikirim. Silakan hubungi pustakawan untuk persetujuan.' 
+          : 'Transaksi peminjaman berhasil diproses.',
         data: record
       });
     } catch (txError) {
@@ -220,7 +217,7 @@ const prosesPengembalian = async (req, res) => {
 
     const tx = checkTxResult.rows[0];
 
-    // B. Verifikasi kelayakan pengembalian (prosesVerifikasiPengembalian)
+    // B. Verifikasi kelayakan pengembalian
     let detail;
     try {
       detail = await prosesVerifikasiPengembalian(client, id_transaksi, id_buku);
@@ -232,17 +229,19 @@ const prosesPengembalian = async (req, res) => {
     // C. Hitung Denda Otomatis
     const tanggalKembali = new Date();
     const denda = hitungDendaOtomatis(tx.batas_kembali, tanggalKembali);
+    const statusDenda = denda > 0 ? 'Belum Lunas' : 'Lunas';
 
     // D. Update detail_transaksi
     const updateDetailQuery = `
       UPDATE detail_transaksi
-      SET tanggal_kembali = $1, jumlah_denda = $2, status_buku = 'Dikembalikan'
-      WHERE id_transaksi = $3 AND id_buku = $4
+      SET tanggal_kembali = $1, jumlah_denda = $2, status_buku = 'Dikembalikan', status_denda = $3
+      WHERE id_transaksi = $4 AND id_buku = $5
       RETURNING *
     `;
     const updateDetailResult = await client.query(updateDetailQuery, [
       tanggalKembali,
       denda,
+      statusDenda,
       id_transaksi,
       id_buku
     ]);
@@ -270,6 +269,7 @@ const prosesPengembalian = async (req, res) => {
         tanggal_kembali: updateDetailResult.rows[0].tanggal_kembali,
         jumlah_denda: updateDetailResult.rows[0].jumlah_denda,
         status_buku: updateDetailResult.rows[0].status_buku,
+        status_denda: updateDetailResult.rows[0].status_denda,
         status_transaksi: updateTxResult.rows[0].status_transaksi
       }
     });
@@ -286,12 +286,138 @@ const prosesPengembalian = async (req, res) => {
   }
 };
 
-/**
- * Mendapatkan seluruh daftar transaksi peminjaman (sirkulasi).
- */
-const tampilkanPeminjaman = async (req, res) => {
+// 3. Menyetujui Pengajuan Peminjaman Anggota (PUT)
+const setujuiPeminjaman = async (req, res) => {
+  const { id } = req.params; // id_transaksi
+
+  const client = await pool.connect();
   try {
+    await client.query('BEGIN');
+
+    // A. Dapatkan data transaksi peminjaman
+    const checkTxQuery = 'SELECT * FROM transaksi_peminjaman WHERE id_transaksi = $1 FOR UPDATE';
+    const checkTxResult = await client.query(checkTxQuery, [id]);
+
+    if (checkTxResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Transaksi peminjaman tidak ditemukan' });
+    }
+
+    const tx = checkTxResult.rows[0];
+    if (tx.status_transaksi !== 'Pengajuan') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'Transaksi ini sudah disetujui atau sudah selesai' });
+    }
+
+    // B. Dapatkan detail transaksi
+    const checkDetailQuery = 'SELECT id_buku FROM detail_transaksi WHERE id_transaksi = $1 FOR UPDATE';
+    const checkDetailResult = await client.query(checkDetailQuery, [id]);
+
+    if (checkDetailResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Detail transaksi tidak ditemukan' });
+    }
+
+    const idBuku = checkDetailResult.rows[0].id_buku;
+
+    // C. Validasi stok buku kembali (Lock)
+    const checkBukuQuery = 'SELECT stok FROM buku WHERE id_buku = $1 FOR UPDATE';
+    const checkBukuResult = await client.query(checkBukuQuery, [idBuku]);
+
+    if (checkBukuResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Buku tidak ditemukan' });
+    }
+
+    const stok = checkBukuResult.rows[0].stok;
+    if (stok <= 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'Stok buku habis. Peminjaman tidak dapat disetujui.' });
+    }
+
+    // D. Update status transaksi dan detail transaksi
+    const tanggalPinjam = new Date();
+    const batasKembali = new Date();
+    batasKembali.setDate(tanggalPinjam.getDate() + 7);
+
+    const updateTxQuery = `
+      UPDATE transaksi_peminjaman 
+      SET status_transaksi = 'Berjalan', tanggal_pinjam = $1, batas_kembali = $2
+      WHERE id_transaksi = $3
+    `;
+    await client.query(updateTxQuery, [tanggalPinjam, batasKembali, id]);
+
+    const updateDetailQuery = `
+      UPDATE detail_transaksi
+      SET status_buku = 'Dipinjam'
+      WHERE id_transaksi = $1
+    `;
+    await client.query(updateDetailQuery, [id]);
+
+    // E. Potong stok buku
+    const updateStokQuery = 'UPDATE buku SET stok = stok - 1 WHERE id_buku = $1';
+    await client.query(updateStokQuery, [idBuku]);
+
+    await client.query('COMMIT');
+    return res.status(200).json({
+      message: 'Peminjaman berhasil disetujui, status berubah menjadi berjalan.'
+    });
+
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error saat menyetujui peminjaman:', error);
+    return res.status(500).json({
+      message: 'Terjadi kesalahan server saat memproses persetujuan peminjaman',
+      error: error.message
+    });
+  } finally {
+    client.release();
+  }
+};
+
+// 4. Memproses Pembayaran Denda (PUT)
+const bayarDenda = async (req, res) => {
+  const { id } = req.params; // id_detail transaksi
+
+  try {
+    const checkDetail = await pool.query('SELECT * FROM detail_transaksi WHERE id_detail = $1', [id]);
+    if (checkDetail.rows.length === 0) {
+      return res.status(404).json({ message: 'Detail transaksi tidak ditemukan' });
+    }
+
+    const detail = checkDetail.rows[0];
+    if (detail.status_denda === 'Lunas') {
+      return res.status(400).json({ message: 'Denda transaksi ini sudah lunas sebelumnya.' });
+    }
+
     const query = `
+      UPDATE detail_transaksi
+      SET status_denda = 'Lunas'
+      WHERE id_detail = $1
+      RETURNING *
+    `;
+    const result = await pool.query(query, [id]);
+
+    return res.status(200).json({
+      message: 'Pembayaran denda berhasil dikonfirmasi dan status denda diubah menjadi Lunas.',
+      data: result.rows[0]
+    });
+
+  } catch (error) {
+    console.error('Error saat konfirmasi bayar denda:', error);
+    return res.status(500).json({
+      message: 'Terjadi kesalahan server saat memproses pembayaran denda',
+      error: error.message
+    });
+  }
+};
+
+// 5. Mendapatkan seluruh daftar transaksi peminjaman (sirkulasi) beserta filter laporan
+const tampilkanPeminjaman = async (req, res) => {
+  const { id_anggota, startDate, endDate } = req.query;
+
+  try {
+    let query = `
       SELECT 
         tp.id_transaksi,
         tp.tanggal_pinjam,
@@ -305,14 +431,39 @@ const tampilkanPeminjaman = async (req, res) => {
         dt.id_detail,
         dt.tanggal_kembali,
         dt.jumlah_denda,
-        dt.status_buku
+        dt.status_buku,
+        dt.status_denda
       FROM transaksi_peminjaman tp
       JOIN anggota a ON tp.id_anggota = a.id_anggota
       JOIN detail_transaksi dt ON tp.id_transaksi = dt.id_transaksi
       JOIN buku b ON dt.id_buku = b.id_buku
-      ORDER BY tp.id_transaksi DESC
     `;
-    const result = await pool.query(query);
+
+    const conditions = [];
+    const params = [];
+
+    if (id_anggota) {
+      params.push(id_anggota);
+      conditions.push(`tp.id_anggota = $${params.length}`);
+    }
+
+    if (startDate) {
+      params.push(startDate);
+      conditions.push(`tp.tanggal_pinjam >= $${params.length}`);
+    }
+
+    if (endDate) {
+      params.push(endDate);
+      conditions.push(`tp.tanggal_pinjam <= $${params.length}`);
+    }
+
+    if (conditions.length > 0) {
+      query += ` WHERE ` + conditions.join(' AND ');
+    }
+
+    query += ` ORDER BY tp.id_transaksi DESC`;
+
+    const result = await pool.query(query, params);
     return res.status(200).json(result.rows);
   } catch (error) {
     console.error('Error saat menampilkan data peminjaman:', error);
@@ -332,6 +483,7 @@ module.exports = {
   prosesPencatatanPeminjaman,
   prosesVerifikasiPengembalian,
   hitungDendaOtomatis,
-  tampilkanPeminjaman
+  tampilkanPeminjaman,
+  setujuiPeminjaman,
+  bayarDenda
 };
-

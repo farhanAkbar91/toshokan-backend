@@ -22,53 +22,61 @@ const aktivasiAkunOtomatis = async (idAnggota) => {
 };
 
 /**
- * Memproses registrasi anggota baru.
+ * Memproses registrasi anggota baru oleh admin.
  * @param {object} req 
  * @param {object} res 
  */
 const prosesRegistrasi = async (req, res) => {
-  const { nomor_identitas, nama_lengkap, alamat, nomor_telepon } = req.body;
+  const { nomor_identitas, nama_lengkap, alamat, nomor_telepon, email, password } = req.body;
 
   // Validasi input awal
   if (!nomor_identitas || !nama_lengkap || !alamat || !nomor_telepon) {
     return res.status(400).json({
-      message: 'Semua kolom (nomor_identitas, nama_lengkap, alamat, nomor_telepon) wajib diisi.'
+      message: 'Kolom nomor identitas, nama lengkap, alamat, dan nomor telepon wajib diisi.'
     });
   }
 
   try {
-    // 1. Validasi Keunikan nomor_identitas (verifikasiKeunikanIdentitas)
+    // 1. Validasi Keunikan nomor_identitas
     const isUnique = await verifikasiKeunikanIdentitas(nomor_identitas);
     if (!isUnique) {
       return res.status(400).json({
-        message: 'Nomor identitas tersebut sudah digunakan'
+        message: 'Nomor identitas tersebut sudah digunakan oleh anggota lain'
       });
+    }
+
+    if (email) {
+      const checkEmail = await pool.query('SELECT id_anggota FROM anggota WHERE email = $1', [email]);
+      if (checkEmail.rows.length > 0) {
+        return res.status(400).json({ message: 'Email tersebut sudah digunakan oleh anggota lain' });
+      }
     }
 
     // 2. Simpan Data Anggota Baru dengan status awal 'Tidak Aktif'
     const insertQuery = `
-      INSERT INTO anggota (nomor_identitas, nama_lengkap, alamat, nomor_telepon, status_akun)
-      VALUES ($1, $2, $3, $4, 'Tidak Aktif')
+      INSERT INTO anggota (nomor_identitas, nama_lengkap, alamat, nomor_telepon, email, password, status_akun)
+      VALUES ($1, $2, $3, $4, $5, $6, 'Tidak Aktif')
       RETURNING *
     `;
     const insertResult = await pool.query(insertQuery, [
       nomor_identitas,
       nama_lengkap,
       alamat,
-      nomor_telepon
+      nomor_telepon,
+      email || null,
+      password || null
     ]);
 
     const newAnggota = insertResult.rows[0];
 
-    // 3. Aktivasi akun otomatis sesuai class diagram
+    // 3. Aktivasi akun otomatis (karena diinput langsung oleh Admin di konter)
     await aktivasiAkunOtomatis(newAnggota.id_anggota);
 
     // Ambil data terbaru anggota setelah aktivasi
     const finalResult = await pool.query('SELECT * FROM anggota WHERE id_anggota = $1', [newAnggota.id_anggota]);
 
-    // 4. Kembalikan respons sukses 201 Created
     return res.status(201).json({
-      message: 'Registrasi berhasil',
+      message: 'Registrasi anggota berhasil & akun diaktifkan otomatis',
       data: finalResult.rows[0]
     });
 
@@ -97,10 +105,50 @@ const tampilkanAnggota = async (req, res) => {
   }
 };
 
+/**
+ * Memperbarui status keaktifan akun anggota (Verifikasi / Suspensi)
+ */
+const updateStatusAkun = async (req, res) => {
+  const { id } = req.params;
+  const { status_akun } = req.body;
+
+  if (!status_akun || (status_akun !== 'Aktif' && status_akun !== 'Tidak Aktif')) {
+    return res.status(400).json({
+      message: "Status akun tidak valid. Harus 'Aktif' atau 'Tidak Aktif'."
+    });
+  }
+
+  try {
+    const query = `
+      UPDATE anggota
+      SET status_akun = $1
+      WHERE id_anggota = $2
+      RETURNING *
+    `;
+    const result = await pool.query(query, [status_akun, id]);
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ message: 'Anggota tidak ditemukan' });
+    }
+
+    return res.status(200).json({
+      message: `Status akun anggota berhasil diperbarui menjadi ${status_akun}`,
+      data: result.rows[0]
+    });
+  } catch (error) {
+    console.error('Error saat memperbarui status anggota:', error);
+    return res.status(500).json({
+      message: 'Terjadi kesalahan saat memperbarui status anggota',
+      error: error.message
+    });
+  }
+};
+
 module.exports = {
   prosesRegistrasi,
   verifikasiKeunikanIdentitas,
   aktivasiAkunOtomatis,
-  tampilkanAnggota
+  tampilkanAnggota,
+  updateStatusAkun
 };
 

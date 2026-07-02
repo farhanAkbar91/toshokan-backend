@@ -8,4 +8,7 @@ router.post('/register', anggotaController.prosesRegistrasi);
 // Mapping GET / ke controller tampilkanAnggota
 router.get('/', anggotaController.tampilkanAnggota);
 
+// Mapping PUT /:id/status ke controller updateStatusAkun (Aktivasi/Verifikasi Admin)
+router.put('/:id/status', anggotaController.updateStatusAkun);
+
 module.exports = router;

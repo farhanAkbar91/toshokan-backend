@@ -8,6 +8,15 @@ const client = new Client({
 });
 
 const createTablesQuery = `
+  -- 0. Tabel Admin
+  CREATE TABLE IF NOT EXISTS admin (
+    id_admin SERIAL PRIMARY KEY,
+    username VARCHAR(50) UNIQUE NOT NULL,
+    password VARCHAR(255) NOT NULL,
+    nama_lengkap VARCHAR(150) NOT NULL,
+    email VARCHAR(100) UNIQUE NOT NULL
+  );
+
   -- 1. Tabel Kategori (Induk)
   CREATE TABLE IF NOT EXISTS kategori (
     id_kategori SERIAL PRIMARY KEY,
@@ -31,9 +40,11 @@ const createTablesQuery = `
     id_anggota SERIAL PRIMARY KEY,
     nomor_identitas VARCHAR(50) UNIQUE NOT NULL,
     nama_lengkap VARCHAR(150) NOT NULL,
+    email VARCHAR(100) UNIQUE,
+    password VARCHAR(255),
     alamat TEXT NOT NULL,
     nomor_telepon VARCHAR(20) NOT NULL,
-    status_akun VARCHAR(20) DEFAULT 'Aktif'
+    status_akun VARCHAR(20) DEFAULT 'Tidak Aktif'
   );
 
   -- 4. Tabel Transaksi Peminjaman (Header)
@@ -54,6 +65,7 @@ const createTablesQuery = `
     tanggal_kembali DATE,
     jumlah_denda DECIMAL(10,2) DEFAULT 0.00,
     status_buku VARCHAR(30) DEFAULT 'Dipinjam',
+    status_denda VARCHAR(20) DEFAULT 'Lunas',
     CONSTRAINT fk_detail_transaksi FOREIGN KEY (id_transaksi) REFERENCES transaksi_peminjaman(id_transaksi) ON DELETE CASCADE,
     CONSTRAINT fk_detail_buku FOREIGN KEY (id_buku) REFERENCES buku(id_buku) ON DELETE CASCADE
   );
